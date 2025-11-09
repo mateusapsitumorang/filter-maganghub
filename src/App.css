@@ -36,3 +36,60 @@
     transform: rotate(360deg);
   }
 }
+
+/* Custom CSS untuk tampilan */
+.app-container {
+  background-color: #f8f9fa; /* Light gray background */
+}
+
+.card-custom {
+  transition: transform 0.3s ease, box-shadow 0.3s ease;
+  border: none;
+  border-radius: 10px;
+  overflow: hidden;
+}
+
+.card-custom:hover {
+  transform: translateY(-5px);
+  box-shadow: 0 10px 20px rgba(0, 0, 0, 0.1);
+}
+
+.card-title {
+  font-weight: bold;
+  color: #007bff; /* Blue primary */
+}
+
+.card-subtitle {
+  font-style: italic;
+  color: #6c757d;
+}
+
+.icon-text {
+  display: flex;
+  align-items: center;
+  margin-bottom: 0.5rem;
+}
+
+.icon-text svg {
+  margin-right: 0.5rem;
+  color: #007bff;
+}
+
+.apply-btn {
+  background-color: #28a745; /* Green for apply */
+  border: none;
+  transition: background-color 0.3s ease;
+}
+
+.apply-btn:hover {
+  background-color: #218838;
+}
+
+footer a {
+  color: #fff;
+  text-decoration: none;
+}
+
+footer a:hover {
+  text-decoration: underline;
+}
