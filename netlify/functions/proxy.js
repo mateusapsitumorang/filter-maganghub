@@ -7,10 +7,12 @@ const globalCache = {
   totalPages: 0,
   isComplete: false,
   lastUpdate: null,
-  isFetching: false
+  isFetching: false,
+  fetchStartTime: null
 };
 
-const CACHE_DURATION = 30 * 60 * 1000; // 30 menit
+const CACHE_DURATION = 60 * 60 * 1000; // 60 menit
+const MAX_EXECUTION_TIME = 8000; // 8 detik untuk safety (Netlify limit 10s)
 
 exports.handler = async (event, context) => {
   const { 
@@ -27,12 +29,34 @@ exports.handler = async (event, context) => {
   const headers = {
     'Access-Control-Allow-Origin': '*',
     'Access-Control-Allow-Headers': 'Content-Type',
-    'Access-Control-Allow-Methods': 'GET, OPTIONS',
+    'Access-Control-Allow-Methods': 'GET, POST, OPTIONS',
     'Content-Type': 'application/json',
   };
 
   if (event.httpMethod === 'OPTIONS') {
     return { statusCode: 200, headers, body: '' };
+  }
+
+  // Handle login proxy (updated endpoint)
+  if (event.path.includes('/login')) {
+    try {
+      const { username, password } = JSON.parse(event.body); // Updated to username
+      const response = await fetch('https://account.kemnaker.go.id/login', { // Updated to /login
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ username, password }),
+      });
+      const text = await response.text(); // Read as text first
+      let data;
+      try {
+        data = JSON.parse(text); // Try parse
+      } catch {
+        data = { error: 'Non-JSON response', raw: text };
+      }
+      return { statusCode: response.status, headers, body: JSON.stringify(data) };
+    } catch (err) {
+      return { statusCode: 500, headers, body: JSON.stringify({ error: err.message }) };
+    }
   }
   
   try {
@@ -46,32 +70,32 @@ exports.handler = async (event, context) => {
       // Check if cache is still valid
       const cacheValid = globalCache.lastUpdate && (now - globalCache.lastUpdate < CACHE_DURATION);
       
-      // Jika cache kosong atau expired, fetch ulang dari awal
+      // Jika cache kosong atau expired, reset
       if (!cacheValid || globalCache.allData.length === 0) {
-        console.log('Cache expired or empty, starting fresh fetch...');
+        console.log('Cache expired or empty, resetting...');
         globalCache.allData = [];
         globalCache.lastFetchedPage = 0;
         globalCache.isComplete = false;
         globalCache.lastUpdate = now;
       }
       
-      // Fetch data jika belum complete dan tidak sedang fetching
+      // Fetch data secara bertahap dengan time limit
       if (!globalCache.isComplete && !globalCache.isFetching) {
         globalCache.isFetching = true;
+        globalCache.fetchStartTime = Date.now();
         
         try {
-          // Tentukan halaman mana yang akan di-fetch
-          const startPage = globalCache.lastFetchedPage + 1;
-          
           // Fetch halaman pertama untuk mendapatkan total pages
-          if (startPage === 1) {
+          if (globalCache.lastFetchedPage === 0) {
             const firstUrl = `https://maganghub.kemnaker.go.id/be/v1/api/list/vacancies-aktif?order_by=${order_by}&order_direction=${order_direction}&limit=100&page=1`;
             
+            console.log('Fetching first page...');
             const firstResponse = await fetch(firstUrl, {
               headers: {
                 'Accept': 'application/json',
                 'User-Agent': 'Mozilla/5.0'
-              }
+              },
+              signal: AbortSignal.timeout(5000)
             });
             
             if (firstResponse.ok) {
@@ -79,17 +103,29 @@ exports.handler = async (event, context) => {
               globalCache.totalPages = firstData.meta?.pagination?.last_page || 1;
               globalCache.allData = firstData.data || [];
               globalCache.lastFetchedPage = 1;
-              console.log(`First page fetched. Total pages: ${globalCache.totalPages}`);
+              console.log(`First page fetched. Total pages: ${globalCache.totalPages}, Total items in page 1: ${globalCache.allData.length}`);
             }
           }
           
-          // Fetch batch berikutnya (maksimal 30 halaman per call untuk avoid timeout)
-          const maxPagesToFetch = Math.min(startPage + 5000, globalCache.totalPages); // Fetch 30 halaman
-          const batchSize = 10;
+          // Fetch batch berikutnya dengan time limit
+          const startPage = globalCache.lastFetchedPage + 1;
+          const batchSize = 3; // Fetch 3 halaman parallel
+          let pagesFetched = 0;
           
-          for (let batchStart = startPage + 1; batchStart <= maxPagesToFetch; batchStart += batchSize) {
-            const batchEnd = Math.min(batchStart + batchSize - 1, maxPagesToFetch);
-            console.log(`Fetching batch: pages ${batchStart} to ${batchEnd}`);
+          // Loop sampai timeout atau selesai
+          while (startPage + pagesFetched <= globalCache.totalPages) {
+            const elapsedTime = Date.now() - globalCache.fetchStartTime;
+            
+            // Stop jika mendekati timeout
+            if (elapsedTime > MAX_EXECUTION_TIME) {
+              console.log(`Stopping due to time limit. Elapsed: ${elapsedTime}ms`);
+              break;
+            }
+            
+            const batchStart = startPage + pagesFetched;
+            const batchEnd = Math.min(batchStart + batchSize - 1, globalCache.totalPages);
+            
+            console.log(`Fetching pages ${batchStart}-${batchEnd} (${elapsedTime}ms elapsed)`);
             
             const batchPromises = [];
             for (let i = batchStart; i <= batchEnd; i++) {
@@ -99,40 +135,50 @@ exports.handler = async (event, context) => {
                 headers: {
                   'Accept': 'application/json',
                   'User-Agent': 'Mozilla/5.0'
-                }
+                },
+                signal: AbortSignal.timeout(5000)
               })
               .then(res => res.ok ? res.json() : null)
-              .catch(() => null);
+              .catch((err) => {
+                console.error(`Failed page ${i}:`, err.message);
+                return null;
+              });
               
               batchPromises.push(promise);
             }
             
             const batchResults = await Promise.all(batchPromises);
             
+            let itemsAdded = 0;
             batchResults.forEach((data) => {
               if (data && data.data && Array.isArray(data.data)) {
                 globalCache.allData = globalCache.allData.concat(data.data);
+                itemsAdded += data.data.length;
               }
             });
             
             globalCache.lastFetchedPage = batchEnd;
+            pagesFetched = batchEnd - startPage + 1;
+            
+            console.log(`Batch complete. Added ${itemsAdded} items. Total: ${globalCache.allData.length}`);
+            
+            // Check jika sudah selesai semua
+            if (globalCache.lastFetchedPage >= globalCache.totalPages) {
+              globalCache.isComplete = true;
+              console.log(`✅ ALL DATA FETCHED! Total: ${globalCache.allData.length} items from ${globalCache.totalPages} pages`);
+              break;
+            }
           }
           
-          // Check jika sudah complete
-          if (globalCache.lastFetchedPage >= globalCache.totalPages) {
-            globalCache.isComplete = true;
-            console.log(`Fetch complete! Total items: ${globalCache.allData.length}`);
-          } else {
-            console.log(`Fetched up to page ${globalCache.lastFetchedPage}/${globalCache.totalPages}. Will continue on next request.`);
-          }
-          
+        } catch (error) {
+          console.error('Fetch error:', error);
         } finally {
           globalCache.isFetching = false;
         }
       }
       
       // Filter data yang sudah di-fetch
-      let filteredVacancies = globalCache.allData;
+      let filteredVacancies = [...globalCache.allData];
       
       if (location) {
         const locationLower = location.toLowerCase().trim();
@@ -182,25 +228,21 @@ exports.handler = async (event, context) => {
         });
       }
       
-      console.log(`Filtered results: ${filteredVacancies.length} from ${globalCache.allData.length} total items`);
+      console.log(`Filtered: ${filteredVacancies.length} from ${globalCache.allData.length} total`);
       
-      // Sort data berdasarkan pilihan (bisa dual sorting)
+      // Sort data
       filteredVacancies.sort((a, b) => {
-        // Primary sort: Waktu (jika dipilih)
         if (sort_waktu) {
           const dateA = new Date(a.created_at || 0);
           const dateB = new Date(b.created_at || 0);
           const waktuCompare = sort_waktu === 'desc' ? dateB - dateA : dateA - dateB;
-          
-          // Jika waktu berbeda, return hasil compare
           if (waktuCompare !== 0) return waktuCompare;
         }
         
-        // Secondary sort: Kuota (jika dipilih atau sebagai tiebreaker)
         if (sort_kuota || !sort_waktu) {
           const kuotaA = parseInt(a.jumlah_kuota) || 0;
           const kuotaB = parseInt(b.jumlah_kuota) || 0;
-          const kuotaDirection = sort_kuota || 'desc'; // Default desc jika tidak ada yang dipilih
+          const kuotaDirection = sort_kuota || 'desc';
           return kuotaDirection === 'desc' ? kuotaB - kuotaA : kuotaA - kuotaB;
         }
         
@@ -216,6 +258,10 @@ exports.handler = async (event, context) => {
       const endIndex = startIndex + limit;
       const paginatedData = filteredVacancies.slice(startIndex, endIndex);
       
+      const progressPercentage = globalCache.totalPages > 0 
+        ? Math.round((globalCache.lastFetchedPage / globalCache.totalPages) * 100) 
+        : 0;
+      
       return {
         statusCode: 200,
         headers,
@@ -229,12 +275,15 @@ exports.handler = async (event, context) => {
               total: total,
             },
             cache_info: {
-              fetched_pages: `${globalCache.lastFetchedPage}/${globalCache.totalPages}`,
+              fetched_pages: globalCache.lastFetchedPage,
+              total_pages: globalCache.totalPages,
               fetched_items: globalCache.allData.length,
               is_complete: globalCache.isComplete,
+              progress_percentage: progressPercentage,
+              is_fetching: globalCache.isFetching,
               message: globalCache.isComplete 
-                ? 'Semua data telah dimuat' 
-                : `Memuat data... ${globalCache.lastFetchedPage}/${globalCache.totalPages} halaman. Refresh untuk data lebih lengkap.`
+                ? '✅ Semua data telah dimuat!' 
+                : `⏳ Memuat data... ${progressPercentage}% (${globalCache.lastFetchedPage}/${globalCache.totalPages} halaman). Refresh otomatis berjalan...`
             }
           }
         }),
@@ -248,7 +297,8 @@ exports.handler = async (event, context) => {
         headers: {
           'Accept': 'application/json',
           'User-Agent': 'Mozilla/5.0'
-        }
+        },
+        signal: AbortSignal.timeout(5000)
       });
       
       if (!response.ok) {
@@ -273,7 +323,11 @@ exports.handler = async (event, context) => {
       body: JSON.stringify({ 
         error: 'Failed to fetch data',
         message: error.message,
-        tip: 'Data sedang dimuat secara bertahap. Silakan refresh halaman beberapa kali untuk mendapatkan data yang lebih lengkap.'
+        cache_info: {
+          fetched_pages: globalCache.lastFetchedPage,
+          total_pages: globalCache.totalPages,
+          fetched_items: globalCache.allData.length
+        }
       }),
     };
   }
